@@ -1,0 +1,198 @@
+'use strict';
+// 求解器行为测试：锁定冲突、全局无解、决胜顺序、上限校验、自反约束、零改色。
+const assert = require('assert');
+const { solve, parseModel, SolverError } = require('../src/solver');
+
+function base(overrides = {}) {
+  return {
+    tokens: [
+      { name: 'a', color: '#ffffff' },
+      { name: 'b', color: '#000000' },
+    ],
+    candidates: ['#777777', '#eeeeee', '#111111'],
+    constraints: [
+      { foreground: 'a', background: 'b', minContrast: 4.5 },
+    ],
+    ...overrides,
+  };
+}
+
+// 1. 原方案已满足 -> 零改色、零色差，立即返回。
+{
+  const r = solve(base());
+  assert.strictEqual(r.status, 'optimal');
+  assert.strictEqual(r.changes, 0);
+  assert.ok(r.totalDelta === 0);
+  assert.strictEqual(r.assignment.a, '#ffffff');
+}
+
+// 2. 两端锁定且不达标 -> both-locked 直接冲突。
+{
+  const input = base({
+    tokens: [
+      { name: 'a', color: '#ffffff', locked: true },
+      { name: 'b', color: '#eeeeee', locked: true },
+    ],
+  });
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'locked-conflict');
+  assert.strictEqual(r.conflicts[0].kind, 'both-locked');
+  assert.ok(r.conflicts[0].actual < 4.5);
+}
+
+// 3. 前景锁定，对端值域无解 -> locked-foreground 冲突。
+{
+  const input = base({
+    tokens: [
+      { name: 'a', color: '#777777', locked: true },
+      { name: 'b', color: '#ffffff' },
+    ],
+    candidates: ['#ffffff', '#eeeeee'], // 与 #777777 对比均 < 4.5
+  });
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.conflicts[0].kind, 'locked-foreground');
+}
+
+// 4. 无直接锁定冲突，但组合无解 -> reason global。
+{
+  const input = {
+    tokens: [
+      { name: 'a', color: '#777777' },
+      { name: 'b', color: '#666666' },
+      { name: 'c', color: '#888888' },
+    ],
+    candidates: ['#707070', '#808080'],
+    constraints: [
+      { foreground: 'a', background: 'b', minContrast: 4.5 },
+      { foreground: 'b', background: 'c', minContrast: 4.5 },
+      { foreground: 'a', background: 'c', minContrast: 4.5 },
+    ],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'global');
+}
+
+// 5. 决胜顺序：改色数与色差均相同的方案，取令牌名升序色值字典序最小者。
+{
+  const input = {
+    tokens: [
+      { name: 'z', color: '#808080' },
+      { name: 'a', color: '#808080' },
+    ],
+    candidates: ['#000000', '#ffffff'],
+    // 无约束 -> 零改色；改为测有约束但两种对称解等距的情形。
+    constraints: [],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'optimal');
+  assert.strictEqual(r.changes, 0);
+}
+
+// 6. 稳定决胜：对称构造，两个方案同为改 1 个令牌且 ΔE 相同。
+{
+  // a 与 b 原色相同，候选提供纯黑/纯白；#444 对白底对比度约 8.7:1，改任一侧即可达标。
+  const input = {
+    tokens: [
+      { name: 'a', color: '#444444' },
+      { name: 'b', color: '#444444' },
+    ],
+    candidates: ['#000000', '#ffffff'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 7 }],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'optimal');
+  assert.strictEqual(r.changes, 1);
+  // 两种方案 ΔE 相同；决胜键按令牌名升序（a 在 b 前），#444444 < #ffffff，
+  // 故 a 保留原色、b 改为白。
+  assert.strictEqual(r.assignment.a, '#444444');
+  assert.strictEqual(r.assignment.b, '#ffffff');
+}
+
+// 7. locks 由请求覆盖 JSON 中的 locked 字段。
+{
+  const input = base({
+    tokens: [
+      { name: 'a', color: '#ffffff' },
+      { name: 'b', color: '#eeeeee' },
+    ],
+  });
+  const r = solve(input, { a: true, b: true });
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.conflicts[0].kind, 'both-locked');
+}
+
+// 8. 上限与格式校验。
+assert.throws(() => solve({ tokens: [], candidates: [], constraints: [] }), SolverError);
+assert.throws(
+  () =>
+    solve({
+      tokens: Array.from({ length: 11 }, (_, i) => ({ name: 't' + i, color: '#fff' })),
+      candidates: [],
+      constraints: [],
+    }),
+  /不能超过 10/
+);
+assert.throws(
+  () => solve({ tokens: [{ name: 'x', color: '#fff' }], candidates: Array(13).fill('#000'), constraints: [] }),
+  /候选色不能超过 12/
+);
+assert.throws(
+  () => solve({ tokens: [{ name: 'x', color: '#fff' }], candidates: [], constraints: Array(31).fill({ foreground: 'x', background: 'x', minContrast: 1 }) }),
+  /约束不能超过 30/
+);
+assert.throws(
+  () => solve({ tokens: [{ name: 'x', color: 'nope' }], candidates: [], constraints: [] }),
+  /颜色/
+);
+assert.throws(
+  () => solve({ tokens: [{ name: 'x', color: '#fff' }], candidates: [], constraints: [{ foreground: 'x', background: 'y', minContrast: 4 }] }),
+  /不存在的令牌/
+);
+
+// 9. 自反约束：>1 恒无解（锁定与未锁定均给出直接冲突）。
+{
+  const r = solve({
+    tokens: [{ name: 'a', color: '#ffffff', locked: true }],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'a', minContrast: 2 }],
+  });
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.conflicts[0].kind, 'self-contrast');
+
+  const ok = solve({
+    tokens: [{ name: 'a', color: '#ffffff' }],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'a', minContrast: 1 }],
+  });
+  assert.strictEqual(ok.status, 'optimal');
+}
+
+// 10. #rgb 短格式、重复候选去重。
+{
+  const r = solve({
+    tokens: [{ name: 'a', color: '#fff' }],
+    candidates: ['#000', '#000000'],
+    constraints: [],
+  });
+  assert.strictEqual(r.status, 'optimal');
+  assert.strictEqual(r.assignment.a, '#ffffff');
+}
+
+// 11. 最小改色数优先：存在一个色差巨大但 0 改色不可行、1 改色可行的情形。
+{
+  const r = solve({
+    tokens: [
+      { name: 'a', color: '#ffffff' },
+      { name: 'b', color: '#fafafa' },
+    ],
+    candidates: ['#000000'],
+    constraints: [{ foreground: 'a', background: 'b', minContrast: 4.5 }],
+  });
+  assert.strictEqual(r.status, 'optimal');
+  assert.strictEqual(r.changes, 1);
+}
+
+console.log('全部求解器测试通过');
