@@ -1,7 +1,7 @@
 'use strict';
 
-// 颜色科学工具：sRGB 十六进制 <-> 相对亮度（WCAG 2.x）与 CIE Lab（D65）色差。
-// 全部计算在本机内存完成，无任何外部调用。
+// 颜色科学工具：sRGB 十六进制 <-> 相对亮度（WCAG 2.x）、CIE Lab（D65）色差，
+// 以及色觉缺陷（CVD）模拟。全部计算在本机内存完成，无任何外部调用。
 
 const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
@@ -111,6 +111,61 @@ function deltaE(hexA, hexB) {
   return Math.sqrt(dL * dL + da * da + db * db);
 }
 
+// ---- 色觉缺陷（CVD）模拟 ----
+//
+// 固定模拟矩阵（Machado, Oliveira & Fernandes, 2009，severity = 1.0，行优先，
+// 作用于线性 sRGB）。模拟流程固定为四步：
+//   1. sRGB 分量线性化；
+//   2. 左乘对应视型的 3x3 矩阵；
+//   3. 各分量裁剪到 [0, 1]；
+//   4. 重新编码为 sRGB（8 位十六进制）。
+const VISION_PROFILES = ['normal', 'protanopia', 'deuteranopia', 'tritanopia'];
+
+const CVD_MATRICES = {
+  protanopia: [
+    0.152286, 1.052583, -0.204868,
+    0.114503, 0.786281, 0.099216,
+    -0.003882, -0.048116, 1.051998,
+  ],
+  deuteranopia: [
+    0.367322, 0.860646, -0.227968,
+    0.280085, 0.672501, 0.047413,
+    -0.011820, 0.042940, 0.968881,
+  ],
+  tritanopia: [
+    1.255528, -0.076749, -0.178779,
+    -0.078411, 0.930809, 0.147602,
+    0.004733, 0.691367, 0.303900,
+  ],
+};
+
+// 线性光分量（0-1）-> sRGB 分量（0-255 整数）
+function srgbChannelFromLinear(l) {
+  const s = l <= 0.0031308 ? 12.92 * l : 1.055 * Math.pow(l, 1 / 2.4) - 0.055;
+  return Math.min(255, Math.max(0, Math.round(s * 255)));
+}
+
+/**
+ * 模拟指定视型下看到的颜色。输入输出均为 #rrggbb；normal 视型不做任何变换。
+ */
+function simulateColor(hex, profile) {
+  if (profile === 'normal') return hex;
+  const m = CVD_MATRICES[profile];
+  if (!m) {
+    throw new Error(`未知视型 "${profile}"`);
+  }
+  const { r, g, b } = hexToRgb(hex);
+  const R = srgbChannelToLinear(r);
+  const G = srgbChannelToLinear(g);
+  const B = srgbChannelToLinear(b);
+  const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+  const r2 = clamp01(m[0] * R + m[1] * G + m[2] * B);
+  const g2 = clamp01(m[3] * R + m[4] * G + m[5] * B);
+  const b2 = clamp01(m[6] * R + m[7] * G + m[8] * B);
+  const toHex = (v) => srgbChannelFromLinear(v).toString(16).padStart(2, '0');
+  return `#${toHex(r2)}${toHex(g2)}${toHex(b2)}`;
+}
+
 module.exports = {
   normalizeHex,
   hexToRgb,
@@ -118,4 +173,6 @@ module.exports = {
   contrastRatio,
   hexToLab,
   deltaE,
+  simulateColor,
+  VISION_PROFILES,
 };

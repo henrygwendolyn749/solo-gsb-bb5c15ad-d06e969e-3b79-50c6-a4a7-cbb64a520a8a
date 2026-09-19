@@ -20,12 +20,15 @@ docker compose up --build
 
 - 导入 JSON（粘贴文本或选择文件），内置「载入示例」按钮；
 - 可**锁定任意令牌**：被锁定的令牌保持原色，不参与改色；
+- **色觉鲁棒模式**：输入可声明 `profiles`（`normal` / `protanopia` / `deuteranopia` /
+  `tritanopia`），每条约束必须在**全部所选视型**下都达到 `minContrast` 才视为可行；
 - **全局分支定界搜索**（branch and bound），在满足全部 WCAG 对比度约束的方案中，按以下顺序优化：
   1. **改色令牌数最少**；
   2. **CIE Lab 总色差最小**（ΔE\*ab / CIE76，D65 白点）；
   3. 稳定决胜：按令牌名升序、以色值字典序最小者为准（相同输入永远得到相同结果）；
-- 页面展示每条约束的**改前 / 改后对比度比值**与是否达标；
-- **无解时列出锁定颜色直接造成的冲突**（两端锁定不达标、单侧锁定导致对端无可用颜色、自反约束等）；
+- 页面按约束列出**各视型的改前 / 改后对比度比值**与是否达标，并**突出最差视型**；
+- **无解时列出锁定颜色直接造成的冲突**（两端锁定不达标、单侧锁定导致对端无可用颜色、
+  自反约束等），并说明**具体失败视型**；
 - 一键**导出替换后的令牌 JSON**（保留输入中的其他字段与结构，仅替换颜色）；
 - 搜索采用 MRV 变量选择 + 相容位掩码前向检查 + 改色数/色差单调下界剪枝。
 
@@ -41,7 +44,8 @@ docker compose up --build
   "candidates": ["#0f172a", "#1f2937", "#ffffff"],
   "constraints": [
     { "foreground": "text", "background": "bg", "minContrast": 4.5 }
-  ]
+  ],
+  "profiles": ["normal", "protanopia"]
 }
 ```
 
@@ -50,6 +54,9 @@ docker compose up --build
 - `locked: true` 或在页面勾选锁定的令牌只能保留原色；
 - `minContrast` 为 WCAG 对比度（1–21）。常用阈值：普通文本 **4.5**、大号文本/UI **3**、
   严格文本 **7**；
+- `profiles`（可选）：色觉视型数组，可选值 `normal`、`protanopia`、`deuteranopia`、
+  `tritanopia`；**未提供时等同 `["normal"]`**。重复值自动去重；空数组、非数组或
+  未知视型会被拒绝并返回明确错误。
 
 | 项目 | 上限 |
 | --- | --- |
@@ -58,6 +65,31 @@ docker compose up --build
 | 约束条数 | **30** |
 
 超出上限或格式有误时，页面与接口都会返回明确的错误信息。
+
+## 色觉鲁棒模式
+
+声明 `profiles` 后，求解器会把每个颜色按下述**固定流程**模拟为各视型下看到的颜色，
+再计算 WCAG 对比度。每条约束必须在**全部所选视型**中都达到 `minContrast`，
+才进入既有的最少改色、最小总色差与稳定决胜优化。
+
+每个颜色的模拟流程（对 `normal` 以外的视型）：
+
+1. **sRGB 线性化**：各分量按标准公式转为线性光；
+2. **矩阵变换**：左乘下表对应视型的 3×3 矩阵（行优先，作用于线性 RGB）；
+3. **裁剪**：各分量裁剪到 `[0, 1]`；
+4. **重新编码**：按 sRGB 伽马公式编码回 8 位十六进制颜色。
+
+固定模拟矩阵（Machado, Oliveira & Fernandes, 2009，severity = 1.0）：
+
+| 视型 | 模拟矩阵（行优先，作用于线性 sRGB） |
+| --- | --- |
+| `protanopia` | `0.152286  1.052583 -0.204868`<br>`0.114503  0.786281  0.099216`<br>`-0.003882 -0.048116  1.051998` |
+| `deuteranopia` | `0.367322  0.860646 -0.227968`<br>`0.280085  0.672501  0.047413`<br>`-0.011820  0.042940  0.968881` |
+| `tritanopia` | `1.255528 -0.076749 -0.178779`<br>`-0.078411  0.930809  0.147602`<br>`0.004733  0.691367  0.303900` |
+
+`normal` 视型不做任何变换。页面上可直接勾选视型（第 3 区），勾选结果会同步为输入
+JSON 的 `profiles` 字段；结果表格按约束逐行展示各视型的改前/改后比值，改后比值
+最低的**最差视型**会以高亮行与徽章标出。
 
 ## 示例数据
 
@@ -84,12 +116,21 @@ docker compose up --build
 将示例中的 `primary` 也锁定（保持 `#2563eb`）、同时锁定 `primaryText` 为 `#1d4ed8`，
 会得到无解，页面直接列出：
 
-> 约束 #5（primaryText / primary）两端均被锁定：当前对比度 1.3 小于要求的 4.5
+> 约束 #5（primaryText / primary）两端均被锁定：视型 normal 下对比度 1.3，低于要求的 4.5
+
+启用色觉鲁棒模式后，冲突条目还会通过 `failedProfiles` 与页面徽章说明具体失败视型，例如：
+
+> 约束 #1（text / bg）两端均被锁定：视型 protanopia 下对比度 3.287，低于要求的 4.5
 
 ## HTTP 接口（可选）
 
 - `POST /api/solve`：请求体 `{ "payload": <输入JSON>, "locks": { "令牌名": true } }`，
   返回最优方案、每条约束改前/改后比值与导出用 JSON；
+  - 响应顶层 `profiles` 为实际生效的视型列表（去重后）；
+  - `report.constraints[*].perProfile` 按视型给出改前/改后比值与是否达标，
+    `worstProfile` 标注改后比值最低的视型；聚合字段 `beforeRatio` / `afterRatio`
+    取全部视型中的最差（最低）值；
+  - 无解时 `conflicts[*].failedProfiles` 列出具体失败视型；
 - `GET /api/health`：健康检查。
 
 ## 无 Docker 时的本地开发方式（可选）
@@ -106,8 +147,8 @@ npm start
 ```
 Dockerfile              # 多阶段构建，构建期自动准备依赖
 compose.yaml            # docker compose up --build 即启动
-src/color.js            # sRGB/WCAG 亮度、对比度与 CIE Lab 色差
-src/solver.js           # 输入校验 + 分支定界搜索 + 锁定冲突诊断
+src/color.js            # sRGB/WCAG 亮度、对比度、CIE Lab 色差与色觉缺陷模拟矩阵
+src/solver.js           # 输入校验 + 分支定界搜索 + 锁定冲突诊断（含失败视型）
 src/server.js           # Express 服务与 /api/solve
 public/                 # 原生前端（HTML/CSS/JS）
 examples/               # 示例数据

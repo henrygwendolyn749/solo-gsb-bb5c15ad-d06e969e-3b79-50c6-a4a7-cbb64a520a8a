@@ -12,6 +12,7 @@ const els = {
   solveBtn: $('solveBtn'),
   parseError: $('parseError'),
   tokenLocks: $('tokenLocks'),
+  profileList: $('profileList'),
   inputMeta: $('inputMeta'),
   resultPlaceholder: $('resultPlaceholder'),
   resultArea: $('resultArea'),
@@ -29,6 +30,15 @@ let parsed = null; // 最近一次成功解析的 JSON 对象
 let lastExport = null; // 最近一次最优解的导出对象
 
 const LIMITS = { tokens: 10, candidates: 12, constraints: 30 };
+
+// 色觉鲁棒模式支持的视型（与服务端一致）。
+const KNOWN_PROFILES = ['normal', 'protanopia', 'deuteranopia', 'tritanopia'];
+const PROFILE_LABELS = {
+  normal: 'normal（正常视觉）',
+  protanopia: 'protanopia（红色盲）',
+  deuteranopia: 'deuteranopia（绿色盲）',
+  tritanopia: 'tritanopia（蓝黄色盲）',
+};
 
 // ---------- 解析与锁定面板 ----------
 
@@ -112,6 +122,16 @@ function validateShape(data) {
       return `constraints[${i}].minContrast 必须是 1–21 的数字。`;
     }
   }
+  if (data.profiles !== undefined) {
+    if (!Array.isArray(data.profiles) || data.profiles.length === 0) {
+      return 'profiles 必须是非空数组（不提供该字段时默认仅 normal）。';
+    }
+    for (const p of data.profiles) {
+      if (typeof p !== 'string' || !KNOWN_PROFILES.includes(p)) {
+        return `未知视型 "${p}"（可选：${KNOWN_PROFILES.join('、')}）。`;
+      }
+    }
+  }
   return null;
 }
 
@@ -124,6 +144,7 @@ function refreshLockPanel() {
     empty.textContent = '尚未载入有效数据。';
     els.tokenLocks.appendChild(empty);
     els.inputMeta.textContent = '';
+    refreshProfilePanel();
     return;
   }
   for (const t of parsed.tokens) {
@@ -139,7 +160,7 @@ function refreshLockPanel() {
       t.locked = cb.checked;
       item.classList.toggle('is-locked', cb.checked);
       // 锁定状态同步回文本框中的 JSON。
-      syncLocksIntoText();
+      syncParsedIntoText();
     });
 
     const swatch = document.createElement('span');
@@ -161,10 +182,67 @@ function refreshLockPanel() {
   }
   els.inputMeta.textContent =
     `${parsed.tokens.length} 个令牌 · ${parsed.candidates.length} 个候选色 · ${parsed.constraints.length} 条约束`;
+  refreshProfilePanel();
 }
 
-// 将面板上的锁定勾选状态回写到 textarea 的 JSON 文本。
-function syncLocksIntoText() {
+// 当前生效的视型：未提供 profiles 时等同仅 normal；按固定顺序返回。
+function currentProfiles() {
+  if (!parsed || !Array.isArray(parsed.profiles) || parsed.profiles.length === 0) {
+    return ['normal'];
+  }
+  const set = new Set(parsed.profiles);
+  return KNOWN_PROFILES.filter((p) => set.has(p));
+}
+
+function refreshProfilePanel() {
+  els.profileList.innerHTML = '';
+  const selected = new Set(currentProfiles());
+  for (const id of KNOWN_PROFILES) {
+    const item = document.createElement('div');
+    item.className = 'profile-item' + (selected.has(id) ? ' is-active' : '');
+
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = selected.has(id);
+    cb.disabled = !parsed;
+    cb.dataset.profile = id;
+    cb.addEventListener('change', () => {
+      if (!parsed) {
+        cb.checked = true;
+        return;
+      }
+      const boxes = els.profileList.querySelectorAll('input[type="checkbox"]');
+      const chosen = KNOWN_PROFILES.filter((p) =>
+        [...boxes].some((b) => b.dataset.profile === p && b.checked)
+      );
+      if (chosen.length === 0) {
+        cb.checked = true;
+        showParseError('至少保留一个视型；不提供 profiles 字段时默认仅 normal。');
+        return;
+      }
+      els.parseError.hidden = true;
+      // 以固定顺序写回 JSON（仅 normal 时移除该字段，回到缺省语义）。
+      if (chosen.length === 1 && chosen[0] === 'normal') {
+        delete parsed.profiles;
+      } else {
+        parsed.profiles = chosen;
+      }
+      syncParsedIntoText();
+      refreshProfilePanel();
+    });
+
+    const text = document.createElement('span');
+    text.textContent = PROFILE_LABELS[id];
+
+    label.append(cb, text);
+    item.appendChild(label);
+    els.profileList.appendChild(item);
+  }
+}
+
+// 将面板上的锁定勾选与视型选择状态回写到 textarea 的 JSON 文本。
+function syncParsedIntoText() {
   if (!parsed) return;
   try {
     els.jsonInput.value = JSON.stringify(parsed, null, 2);
@@ -288,28 +366,39 @@ function renderResult(body) {
         ' / ' + reportSource.constraints.length,
       '满足约束'
     ),
+    stat((reportSource.profiles || []).length + ' 种', '色觉视型'),
     stat(body.stats.nodes.toLocaleString('zh-CN'), '搜索节点'),
     stat(body.stats.elapsedMs + ' ms', '耗时')
   );
   els.resultSummary.appendChild(summary);
 
-  // 约束表
+  // 约束表：每条约束按视型逐行展示改前/改后比值，最差视型行高亮。
   els.constraintTable.innerHTML = '';
-  els.constraintTable.appendChild(
-    buildTable(
-      ['#', '前景', '背景', '最小对比度', '改前', '', '改后', '结果'],
-      reportSource.constraints.map((c) => [
-        String(c.index + 1),
-        c.foreground,
-        c.background,
-        { num: c.minContrast },
-        { num: ratioText(c.beforeRatio), cls: c.beforePass ? 'good' : 'bad' },
-        '→',
-        { num: ratioText(c.afterRatio), cls: c.afterPass ? 'good' : 'bad', strong: true },
-        c.afterPass ? pill('满足', true) : pill('不满足', false),
-      ])
-    )
-  );
+  {
+    const rows = [];
+    for (const c of reportSource.constraints) {
+      c.perProfile.forEach((p, pi) => {
+        const isWorst = c.worstProfile === p.profile;
+        rows.push({
+          cls: (pi === 0 ? 'group-start' : '') + (isWorst ? ' worst-profile' : ''),
+          cells: [
+            pi === 0 ? String(c.index + 1) : '',
+            pi === 0 ? c.foreground : '',
+            pi === 0 ? c.background : '',
+            pi === 0 ? { num: c.minContrast } : '',
+            profileCell(p.profile, isWorst),
+            { num: ratioText(p.beforeRatio), cls: p.beforePass ? 'good' : 'bad' },
+            '→',
+            { num: ratioText(p.afterRatio), cls: p.afterPass ? 'good' : 'bad', strong: true },
+            p.afterPass ? pill('满足', true) : pill('不满足', false),
+          ],
+        });
+      });
+    }
+    els.constraintTable.appendChild(
+      buildTable(['#', '前景', '背景', '最小对比度', '视型', '改前', '', '改后', '结果'], rows)
+    );
+  }
 
   // 令牌表
   els.tokenTable.innerHTML = '';
@@ -358,6 +447,16 @@ function colorCell(hex) {
   return { html: `<span class="cell-color"><span class="swatch" style="background:${hex}"></span>${hex}</span>` };
 }
 
+// 视型单元格：视型名 + （如适用）“最差视型”徽章。
+function profileCell(profile, isWorst) {
+  const label = PROFILE_LABELS[profile] || profile;
+  return {
+    html:
+      `<span class="profile-name">${label}</span>` +
+      (isWorst ? '<span class="worst-badge">最差视型</span>' : ''),
+  };
+}
+
 function buildTable(headers, rows) {
   const table = document.createElement('table');
   const thead = document.createElement('thead');
@@ -372,8 +471,11 @@ function buildTable(headers, rows) {
 
   const tbody = document.createElement('tbody');
   for (const row of rows) {
+    // 行可以是单元格数组，也可以是 { cells, cls }（cls 为行级 CSS 类）。
+    const cells = Array.isArray(row) ? row : row.cells;
     const tr = document.createElement('tr');
-    for (const cell of row) {
+    if (!Array.isArray(row) && row.cls) tr.className = row.cls.trim();
+    for (const cell of cells) {
       const td = document.createElement('td');
       if (cell && typeof cell === 'object' && cell.html) {
         td.innerHTML = cell.html;
@@ -407,7 +509,21 @@ function renderConflicts(body) {
   const conflicts = body.conflicts || [];
   for (const c of conflicts) {
     const li = document.createElement('li');
-    li.textContent = c.message || JSON.stringify(c);
+    const msg = document.createElement('span');
+    msg.textContent = c.message || JSON.stringify(c);
+    li.appendChild(msg);
+    // 具体失败视型徽章
+    if (Array.isArray(c.failedProfiles) && c.failedProfiles.length > 0) {
+      const badges = document.createElement('span');
+      badges.className = 'profile-badges';
+      for (const p of c.failedProfiles) {
+        const b = document.createElement('span');
+        b.className = 'profile-badge';
+        b.textContent = '失败视型 ' + p;
+        badges.appendChild(b);
+      }
+      li.appendChild(badges);
+    }
     els.conflictList.appendChild(li);
   }
 }

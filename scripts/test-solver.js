@@ -1,7 +1,7 @@
 'use strict';
-// 求解器行为测试：锁定冲突、全局无解、决胜顺序、上限校验、自反约束、零改色。
+// 求解器行为测试：锁定冲突、全局无解、决胜顺序、上限校验、自反约束、零改色、色觉鲁棒模式。
 const assert = require('assert');
-const { solve, parseModel, SolverError } = require('../src/solver');
+const { solve, buildReport, parseModel, SolverError } = require('../src/solver');
 
 function base(overrides = {}) {
   return {
@@ -193,6 +193,139 @@ assert.throws(
   });
   assert.strictEqual(r.status, 'optimal');
   assert.strictEqual(r.changes, 1);
+}
+
+// 12. profiles 校验：缺省为 ['normal']；非数组、空数组、未知视型均被拒绝；重复值去重。
+{
+  const r = solve(base());
+  assert.deepStrictEqual(r.profiles, ['normal']);
+
+  assert.throws(() => solve(base({ profiles: 'normal' })), /profiles 必须是数组/);
+  assert.throws(() => solve(base({ profiles: [] })), /不能为空数组/);
+  assert.throws(() => solve(base({ profiles: ['normal', 'achromatopsia'] })), /未知视型/);
+  assert.throws(() => solve(base({ profiles: [42] })), /未知视型/);
+
+  const deduped = solve(base({ profiles: ['protanopia', 'normal', 'protanopia'] }));
+  assert.deepStrictEqual(deduped.profiles, ['protanopia', 'normal']);
+}
+
+// 13. 色觉鲁棒模式：normal 达标但 protanopia 不达标时必须继续改色。
+{
+  // #ff0000 / #000000：normal 对比度约 5.25:1（达标），protanopia 模拟后约 3.29:1（不达标）。
+  const input = {
+    tokens: [
+      { name: 'text', color: '#ff0000' },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: ['#ffffff'],
+    constraints: [{ foreground: 'text', background: 'bg', minContrast: 4.5 }],
+  };
+  const normalOnly = solve(input);
+  assert.strictEqual(normalOnly.status, 'optimal');
+  assert.strictEqual(normalOnly.changes, 0);
+
+  const robust = solve({ ...input, profiles: ['normal', 'protanopia'] });
+  assert.strictEqual(robust.status, 'optimal');
+  assert.strictEqual(robust.changes, 1);
+  assert.strictEqual(robust.assignment.text, '#ffffff');
+
+  const report = buildReport(
+    { ...input, profiles: ['normal', 'protanopia'] },
+    null,
+    robust.assignment
+  );
+  assert.deepStrictEqual(report.profiles, ['normal', 'protanopia']);
+  const c = report.constraints[0];
+  assert.strictEqual(c.perProfile.length, 2);
+  const byProfile = Object.fromEntries(c.perProfile.map((e) => [e.profile, e]));
+  assert.ok(byProfile.normal.beforePass);
+  assert.ok(!byProfile.protanopia.beforePass);
+  assert.ok(byProfile.protanopia.beforeRatio < 4.5);
+  assert.ok(c.afterPass);
+  // 改后各视型均为 21:1，并列时最差视型取 profiles 中靠前者。
+  assert.strictEqual(c.worstProfile, 'normal');
+}
+
+// 14. 最差视型标注：改后比值最低的视型被标记为 worstProfile，聚合 afterRatio 取最差值。
+{
+  // #ff8888 / #000000：normal 约 9.1:1，protanopia 约 7.6:1，均达标但 protanopia 更低。
+  const input = {
+    tokens: [
+      { name: 'text', color: '#ff0000' },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: ['#ff8888'],
+    constraints: [{ foreground: 'text', background: 'bg', minContrast: 4.5 }],
+    profiles: ['normal', 'protanopia'],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'optimal');
+  assert.strictEqual(r.assignment.text, '#ff8888');
+
+  const report = buildReport(input, null, r.assignment);
+  const c = report.constraints[0];
+  assert.strictEqual(c.worstProfile, 'protanopia');
+  const byProfile = Object.fromEntries(c.perProfile.map((e) => [e.profile, e]));
+  assert.ok(byProfile.protanopia.afterRatio < byProfile.normal.afterRatio);
+  assert.strictEqual(c.afterRatio, byProfile.protanopia.afterRatio);
+  assert.strictEqual(c.beforeRatio, Math.min(byProfile.normal.beforeRatio, byProfile.protanopia.beforeRatio));
+}
+
+// 15. 两端锁定冲突：failedProfiles 与消息都必须说明具体失败视型。
+{
+  const input = {
+    tokens: [
+      { name: 'text', color: '#ff0000', locked: true },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: ['#ffffff'],
+    constraints: [{ foreground: 'text', background: 'bg', minContrast: 4.5 }],
+    profiles: ['normal', 'protanopia'],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'locked-conflict');
+  assert.strictEqual(r.conflicts[0].kind, 'both-locked');
+  assert.deepStrictEqual(r.conflicts[0].failedProfiles, ['protanopia']);
+  assert.ok(r.conflicts[0].message.includes('protanopia'));
+  assert.ok(r.conflicts[0].actual < 4.5);
+}
+
+// 16. 单侧锁定冲突：前景锁定，protanopia 下对端值域无解。
+{
+  const input = {
+    tokens: [
+      { name: 'text', color: '#ff0000', locked: true },
+      { name: 'bg', color: '#000000' },
+    ],
+    candidates: ['#111111', '#222222'],
+    constraints: [{ foreground: 'text', background: 'bg', minContrast: 4.5 }],
+    profiles: ['normal', 'protanopia'],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.conflicts[0].kind, 'locked-foreground');
+  assert.deepStrictEqual(r.conflicts[0].failedProfiles, ['protanopia']);
+  assert.ok(r.conflicts[0].message.includes('protanopia'));
+}
+
+// 17. 全视型可行解：四个视型同时参与时搜索仍收敛且全部达标。
+{
+  const input = {
+    tokens: [
+      { name: 'text', color: '#ff0000' },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: ['#ffffff', '#ff8888'],
+    constraints: [{ foreground: 'text', background: 'bg', minContrast: 4.5 }],
+    profiles: ['normal', 'protanopia', 'deuteranopia', 'tritanopia'],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'optimal');
+  assert.strictEqual(r.changes, 1);
+  const report = buildReport(input, null, r.assignment);
+  assert.strictEqual(report.constraints[0].perProfile.length, 4);
+  assert.ok(report.constraints[0].afterPass);
 }
 
 console.log('全部求解器测试通过');
