@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { solve, buildReport, buildExport } = require('../src/solver');
-const { contrastRatio } = require('../src/color');
+const { contrastRatioProfile } = require('../src/color');
 
 const sample = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', 'examples', 'sample-palette.json'), 'utf8')
@@ -35,7 +35,9 @@ if (result.status === 'optimal') {
         if (assign[n] !== t.original) { changes++; d += deltaE(t.original, assign[n]); }
       }
       for (const con of model.constraints) {
-        if (contrastRatio(assign[con.a], assign[con.b]) + 1e-9 < con.min) return;
+        for (const p of model.profiles) {
+          if (contrastRatioProfile(assign[con.a], assign[con.b], p) + 1e-9 < con.min) return;
+        }
       }
       const key = [...names].sort().map((n) => assign[n]).join('|');
       if (!best || changes < best.changes ||

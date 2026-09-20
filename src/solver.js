@@ -5,6 +5,8 @@
 // 问题模型：
 //   - 每个令牌可在“原色”与全局候选色构成的有限域中取值；被锁定的令牌只能保留原色。
 //   - 每条约束要求两个令牌的 WCAG 对比度 >= minContrast。
+//   - 色觉鲁棒模式：profiles 声明一组色觉视型（缺省仅 normal），约束必须在
+//     全部所选视型的模拟色下都达标，才视为可行。
 //
 // 优化目标（字典序）：
 //   1. 改色令牌数最少；
@@ -15,9 +17,16 @@
 //   - 以“当前改色数 + ΔE 增量”作为随路径单调递增的下界剪枝；
 //   - MRV（最小剩余值域）变量选择 + 基于相容位掩码的前向检查；
 //   - 每个变量先尝试原色：原方案可行时可立即得到零改色最优解；
-//   - 无解时先枚举由锁定颜色“直接”造成的冲突。
+//   - 无解时先枚举由锁定颜色“直接”造成的冲突（含具体失败视型）。
 
-const { normalizeHex, contrastRatio, deltaE } = require('./color');
+const {
+  normalizeHex,
+  contrastRatioProfile,
+  deltaE,
+  simulateHex,
+  relativeLuminance,
+  PROFILE_NAMES,
+} = require('./color');
 
 const MAX_TOKENS = 10;
 const MAX_CANDIDATES = 12;
@@ -124,6 +133,25 @@ function parseModel(input, locks) {
     constraints.push({ index: i, a, b, min });
   });
 
+  // 色觉鲁棒模式：profiles 缺省等同 ["normal"]；去重后按固定顺序排列，拒绝未知值。
+  let profilesRaw = input.profiles;
+  if (profilesRaw === undefined || profilesRaw === null) {
+    profilesRaw = ['normal'];
+  }
+  if (!Array.isArray(profilesRaw) || profilesRaw.length === 0) {
+    throw new SolverError(`profiles 必须是非空数组，可选值：${PROFILE_NAMES.join(', ')}`);
+  }
+  const profileSet = new Set();
+  for (const p of profilesRaw) {
+    if (typeof p !== 'string' || !PROFILE_NAMES.includes(p)) {
+      throw new SolverError(
+        `profiles 包含未知视型 ${JSON.stringify(p)}，可选值：${PROFILE_NAMES.join(', ')}`
+      );
+    }
+    profileSet.add(p);
+  }
+  const profiles = PROFILE_NAMES.filter((p) => profileSet.has(p));
+
   // 每个令牌的值域 = {原色} ∪ 候选色（去重、升序），原色位置单独记录。
   for (const name of tokenNames) {
     const token = tokens.get(name);
@@ -134,11 +162,11 @@ function parseModel(input, locks) {
     token.originalIndex = sorted.indexOf(token.original);
   }
 
-  return { tokenNames, tokens, candidates, constraints };
+  return { tokenNames, tokens, candidates, constraints, profiles };
 }
 
 /**
- * 预处理：统一全局色表、对比度表、每条约束的相容位掩码与令牌关联关系。
+ * 预处理：统一全局色表、各视型的模拟色与对比度表、每条约束的相容位掩码与令牌关联关系。
  */
 function preprocess(model, activeConstraints) {
   const allColors = new Set(model.candidates);
@@ -149,23 +177,48 @@ function preprocess(model, activeConstraints) {
   const n = colors.length;
   const indexOf = new Map(colors.map((hex, i) => [hex, i]));
 
-  const ratio = new Float64Array(n * n);
-  for (let i = 0; i < n; i++) {
-    for (let j = i; j < n; j++) {
-      const r = i === j ? 1 : contrastRatio(colors[i], colors[j]);
-      ratio[i * n + j] = r;
-      ratio[j * n + i] = r;
+  const profiles = model.profiles;
+
+  // 每个视型下，各颜色经“线性化 -> 矩阵 -> 裁剪 -> 重新编码”后的模拟色亮度。
+  const lum = profiles.map((profile) => {
+    const arr = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      arr[i] = relativeLuminance(simulateHex(colors[i], profile));
     }
-  }
+    return arr;
+  });
+
+  // 每个视型一张对比度表：ratio[p][i * n + j]。
+  const ratio = profiles.map((_, p) => {
+    const table = new Float64Array(n * n);
+    for (let i = 0; i < n; i++) {
+      for (let j = i; j < n; j++) {
+        const r =
+          i === j
+            ? 1
+            : (Math.max(lum[p][i], lum[p][j]) + 0.05) / (Math.min(lum[p][i], lum[p][j]) + 0.05);
+        table[i * n + j] = r;
+        table[j * n + i] = r;
+      }
+    }
+    return table;
+  });
 
   // 每条活动约束两个方向的相容掩码：
-  // maskA[i] 的第 j 位 = 1 表示 A 侧取颜色 i 时与 B 侧颜色 j 相容。
+  // maskA[i] 的第 j 位 = 1 表示 A 侧取颜色 i 时与 B 侧颜色 j 在全部所选视型下都相容。
   const masksPerConstraint = activeConstraints.map((con) => {
     const maskA = new Uint32Array(n);
     const maskB = new Uint32Array(n);
     for (let i = 0; i < n; i++) {
       for (let j = 0; j < n; j++) {
-        if (ratio[i * n + j] >= con.min) {
+        let ok = true;
+        for (let p = 0; p < profiles.length; p++) {
+          if (ratio[p][i * n + j] < con.min) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) {
           maskA[i] |= 1 << j;
           maskB[j] |= 1 << i;
         }
@@ -191,16 +244,33 @@ function preprocess(model, activeConstraints) {
     domainMaskByToken.set(name, mask);
   }
 
-  return { activeConstraints, colors, n, indexOf, ratio, masksPerConstraint, incidents, domainMaskByToken };
+  return {
+    activeConstraints,
+    colors,
+    n,
+    indexOf,
+    profiles,
+    ratio,
+    masksPerConstraint,
+    incidents,
+    domainMaskByToken,
+  };
 }
 
 /**
  * 枚举由锁定颜色直接造成的冲突（用于无解诊断）：
- *  - both-locked：两个锁定令牌的对比度不达标；
+ *  - both-locked：两个锁定令牌的对比度在某些视型下不达标；
  *  - locked-foreground / locked-background：锁定一侧与对端值域中任何颜色都不相容。
+ * 每条冲突都通过 failedProfiles 与消息文本说明具体失败的视型。
  */
 function findDirectLockConflicts(model, activeConstraints, pre) {
   const conflicts = [];
+  const profiles = pre.profiles;
+
+  // 颜色对 (gi, gj) 在视型 p 下是否满足 min。
+  const passAt = (p, gi, gj, min) => pre.ratio[p][gi * pre.n + gj] >= min;
+  // 颜色对是否在全部所选视型下满足 min。
+  const passAll = (gi, gj, min) => profiles.every((_, p) => passAt(p, gi, gj, min));
 
   for (let ai = 0; ai < activeConstraints.length; ai++) {
     const con = activeConstraints[ai];
@@ -210,8 +280,14 @@ function findDirectLockConflicts(model, activeConstraints, pre) {
     const giB = pre.indexOf.get(tb.original);
 
     if (ta.locked && tb.locked) {
-      const r = pre.ratio[giA * pre.n + giB];
-      if (r < con.min) {
+      const raws = profiles.map((_, p) => pre.ratio[p][giA * pre.n + giB]);
+      const failing = [];
+      raws.forEach((r, p) => {
+        if (r < con.min) failing.push({ profile: profiles[p], ratio: round3(r) });
+      });
+      if (failing.length > 0) {
+        const names = failing.map((f) => f.profile).join('、');
+        const ratios = failing.map((f) => f.ratio).join('、');
         conflicts.push({
           kind: 'both-locked',
           constraintIndex: con.index,
@@ -220,46 +296,56 @@ function findDirectLockConflicts(model, activeConstraints, pre) {
           foregroundColor: ta.original,
           backgroundColor: tb.original,
           minContrast: con.min,
-          actual: round3(r),
+          actual: round3(Math.min(...raws)),
+          failedProfiles: failing.map((f) => f.profile),
+          profileRatios: profiles.map((profile, p) => ({ profile, ratio: round3(raws[p]) })),
           message:
             `约束 #${con.index + 1}（${con.a} / ${con.b}）两端均被锁定：` +
-            `当前对比度 ${round3(r)} 小于要求的 ${con.min}`,
+            `在 ${names} 视型下对比度为 ${ratios}，小于要求的 ${con.min}`,
         });
       }
       continue;
     }
 
-    const { maskA, maskB } = pre.masksPerConstraint[ai];
-    if (ta.locked && !tb.locked) {
-      if ((maskA[giA] & pre.domainMaskByToken.get(con.b)) === 0) {
-        conflicts.push({
-          kind: 'locked-foreground',
-          constraintIndex: con.index,
-          foreground: con.a,
-          background: con.b,
-          foregroundColor: ta.original,
-          minContrast: con.min,
-          message:
-            `约束 #${con.index + 1}：前景 ${con.a} 被锁定为 ${ta.original}，` +
-            `背景 ${con.b} 取值域内任何颜色都无法使对比度达到 ${con.min}`,
-        });
-      }
-    }
-    if (tb.locked && !ta.locked) {
-      if ((maskB[giB] & pre.domainMaskByToken.get(con.a)) === 0) {
-        conflicts.push({
-          kind: 'locked-background',
-          constraintIndex: con.index,
-          foreground: con.a,
-          background: con.b,
-          backgroundColor: tb.original,
-          minContrast: con.min,
-          message:
-            `约束 #${con.index + 1}：背景 ${con.b} 被锁定为 ${tb.original}，` +
-            `前景 ${con.a} 取值域内任何颜色都无法使对比度达到 ${con.min}`,
-        });
-      }
-    }
+    // 单侧锁定：对端值域内不存在“全部视型同时达标”的颜色时构成直接冲突；
+    // failedProfiles 列出单凭该视型就已经无解的视型（可能为空——此时是视型间组合无解）。
+    const oneSided = (lockedSide, lockedToken, otherToken) => {
+      const lockedGi = pre.indexOf.get(lockedToken.original);
+      const otherDomainIdx = otherToken.domain.map((hex) => pre.indexOf.get(hex));
+      const failedProfiles = profiles.filter(
+        (_, p) => !otherDomainIdx.some((gj) => passAt(p, lockedGi, gj, con.min))
+      );
+      const anyAllProfile = otherDomainIdx.some((gj) => passAll(lockedGi, gj, con.min));
+      if (anyAllProfile) return;
+
+      const isForeground = lockedSide === 'foreground';
+      const lockedRole = isForeground ? '前景' : '背景';
+      const otherRole = isForeground ? '背景' : '前景';
+      const otherName = otherToken.name;
+      const message =
+        failedProfiles.length > 0
+          ? `约束 #${con.index + 1}：${lockedRole} ${lockedToken.name} 被锁定为 ${lockedToken.original}，` +
+            `${otherRole} ${otherName} 取值域内任何颜色都无法在 ${failedProfiles.join('、')} ` +
+            `视型下达到对比度 ${con.min}`
+          : `约束 #${con.index + 1}：${lockedRole} ${lockedToken.name} 被锁定为 ${lockedToken.original}，` +
+            `${otherRole} ${otherName} 取值域内没有颜色能在全部所选视型（${profiles.join('、')}）` +
+            `下同时达到对比度 ${con.min}`;
+      conflicts.push({
+        kind: isForeground ? 'locked-foreground' : 'locked-background',
+        constraintIndex: con.index,
+        foreground: con.a,
+        background: con.b,
+        ...(isForeground
+          ? { foregroundColor: lockedToken.original }
+          : { backgroundColor: lockedToken.original }),
+        minContrast: con.min,
+        failedProfiles,
+        message,
+      });
+    };
+
+    if (ta.locked && !tb.locked) oneSided('foreground', ta, tb);
+    if (tb.locked && !ta.locked) oneSided('background', tb, ta);
   }
 
   return conflicts;
@@ -508,7 +594,7 @@ function runSearch(model, pre, options = {}) {
 function solve(input, locks, options = {}) {
   const model = parseModel(input, locks);
 
-  // 自反约束（同一令牌作为前景与背景）：颜色与自身对比度恒为 1。
+  // 自反约束（同一令牌作为前景与背景）：颜色与自身对比度恒为 1（任何视型下都如此）。
   const selfConflicts = [];
   const activeConstraints = [];
   for (const con of model.constraints) {
@@ -522,6 +608,7 @@ function solve(input, locks, options = {}) {
           color: token.original,
           locked: token.locked,
           minContrast: con.min,
+          failedProfiles: model.profiles.slice(),
           message:
             `约束 #${con.index + 1} 的前景与背景同为令牌 ${con.a}：` +
             `任何颜色与自身的对比度都是 1，不可能达到要求的 ${con.min}`,
@@ -536,6 +623,7 @@ function solve(input, locks, options = {}) {
     return {
       status: 'unsatisfiable',
       reason: 'direct-conflict',
+      profiles: model.profiles,
       conflicts: selfConflicts,
       stats: { nodes: 0, elapsedMs: 0 },
     };
@@ -548,6 +636,7 @@ function solve(input, locks, options = {}) {
     return {
       status: 'unsatisfiable',
       reason: 'locked-conflict',
+      profiles: model.profiles,
       conflicts: directConflicts,
       stats: { nodes: 0, elapsedMs: 0 },
     };
@@ -558,6 +647,7 @@ function solve(input, locks, options = {}) {
     return {
       status: 'unsatisfiable',
       reason: 'global',
+      profiles: model.profiles,
       conflicts: [],
       message:
         '不存在同时满足全部约束的配色方案；未发现由锁定颜色直接导致的冲突，' +
@@ -569,19 +659,24 @@ function solve(input, locks, options = {}) {
     return {
       status: 'search-limit',
       reason: 'node-budget',
+      profiles: model.profiles,
       message: `搜索节点数超过上限（${result.nodeBudget}），请放宽约束或增加候选色后重试。`,
       best: result.best,
       stats: result.stats,
     };
   }
+  result.profiles = model.profiles;
   return result;
 }
 
 /**
  * 依据最终赋值生成令牌与约束的改前/改后明细。
+ * 每条约束按视型列出比值；顶层 beforeRatio/afterRatio 取各视型中的最差（最小）值，
+ * beforePass/afterPass 表示“全部所选视型”是否达标。
  */
 function buildReport(input, locks, assignment) {
   const model = parseModel(input, locks);
+  const profiles = model.profiles;
 
   const tokens = model.tokenNames.map((name) => {
     const token = model.tokens.get(name);
@@ -597,24 +692,39 @@ function buildReport(input, locks, assignment) {
   });
 
   const constraints = model.constraints.map((con) => {
-    const before = contrastRatio(
-      model.tokens.get(con.a).original,
-      model.tokens.get(con.b).original
-    );
-    const after = contrastRatio(assignment[con.a], assignment[con.b]);
+    const perProfile = profiles.map((profile) => {
+      const before = contrastRatioProfile(
+        model.tokens.get(con.a).original,
+        model.tokens.get(con.b).original,
+        profile
+      );
+      const after = contrastRatioProfile(assignment[con.a], assignment[con.b], profile);
+      return {
+        profile,
+        beforeRatio: round3(before),
+        afterRatio: round3(after),
+        beforePass: before + 1e-9 >= con.min,
+        afterPass: after + 1e-9 >= con.min,
+      };
+    });
+    const worstBefore = perProfile.reduce((w, e) => (e.beforeRatio < w.beforeRatio ? e : w));
+    const worstAfter = perProfile.reduce((w, e) => (e.afterRatio < w.afterRatio ? e : w));
     return {
       index: con.index,
       foreground: con.a,
       background: con.b,
       minContrast: con.min,
-      beforeRatio: round3(before),
-      afterRatio: round3(after),
-      beforePass: before + 1e-9 >= con.min,
-      afterPass: after + 1e-9 >= con.min,
+      beforeRatio: worstBefore.beforeRatio,
+      afterRatio: worstAfter.afterRatio,
+      beforePass: perProfile.every((e) => e.beforePass),
+      afterPass: perProfile.every((e) => e.afterPass),
+      worstBeforeProfile: worstBefore.profile,
+      worstAfterProfile: worstAfter.profile,
+      profiles: perProfile,
     };
   });
 
-  return { tokens, constraints };
+  return { profiles, tokens, constraints };
 }
 
 /**

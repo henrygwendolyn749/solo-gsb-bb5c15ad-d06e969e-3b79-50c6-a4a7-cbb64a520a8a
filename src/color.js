@@ -1,7 +1,7 @@
 'use strict';
 
-// 颜色科学工具：sRGB 十六进制 <-> 相对亮度（WCAG 2.x）与 CIE Lab（D65）色差。
-// 全部计算在本机内存完成，无任何外部调用。
+// 颜色科学工具：sRGB 十六进制 <-> 相对亮度（WCAG 2.x）、CIE Lab（D65）色差，
+// 以及色觉缺陷（CVD）模拟。全部计算在本机内存完成，无任何外部调用。
 
 const HEX_RE = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 
@@ -58,6 +58,60 @@ function contrastRatio(hexA, hexB) {
   const lighter = Math.max(la, lb);
   const darker = Math.min(la, lb);
   return (lighter + 0.05) / (darker + 0.05);
+}
+
+// ---------- 色觉缺陷（CVD）模拟 ----------
+//
+// 可选视型；normal 为恒等（不做模拟）。
+const PROFILE_NAMES = ['normal', 'protanopia', 'deuteranopia', 'tritanopia'];
+
+// 固定模拟矩阵（README 同步公布）：取自 Machado, Oliveira & Fernandes (2009)
+// 100% 严重度模型，作用于线性化 sRGB 分量。
+const CVD_MATRICES = {
+  protanopia: [
+    [0.152286, 1.052583, -0.204868],
+    [0.114503, 0.786281, 0.099216],
+    [-0.003882, -0.048116, 1.051998],
+  ],
+  deuteranopia: [
+    [0.367322, 0.860646, -0.227968],
+    [0.280085, 0.672501, 0.047413],
+    [-0.011820, 0.042940, 0.968881],
+  ],
+  tritanopia: [
+    [1.255528, -0.076749, -0.178779],
+    [-0.078411, 0.930809, 0.147602],
+    [0.004733, 0.691367, 0.303900],
+  ],
+};
+
+// 线性分量（0-1）-> sRGB 分量（0-255）
+function linearToSrgbChannel(v) {
+  const s = v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
+  return Math.round(Math.min(1, Math.max(0, s)) * 255);
+}
+
+/**
+ * 模拟指定视型下看到的颜色，管线依次为：
+ *   sRGB 线性化 -> 固定矩阵变换 -> 裁剪到 [0,1] -> 重新编码为 #rrggbb。
+ * normal 视型原样返回输入。
+ */
+function simulateHex(hex, profile) {
+  const m = CVD_MATRICES[profile];
+  if (!m) return hex;
+  const { r, g, b } = hexToRgb(hex);
+  const lin = [srgbChannelToLinear(r), srgbChannelToLinear(g), srgbChannelToLinear(b)];
+  const out = m.map((row) =>
+    Math.min(1, Math.max(0, row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]))
+  );
+  return '#' + out.map((v) => linearToSrgbChannel(v).toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * 指定视型下的 WCAG 对比度：先对两端颜色做模拟，再按常规定义计算。
+ */
+function contrastRatioProfile(hexA, hexB, profile) {
+  return contrastRatio(simulateHex(hexA, profile), simulateHex(hexB, profile));
 }
 
 // D65 参考白点
@@ -118,4 +172,8 @@ module.exports = {
   contrastRatio,
   hexToLab,
   deltaE,
+  PROFILE_NAMES,
+  CVD_MATRICES,
+  simulateHex,
+  contrastRatioProfile,
 };

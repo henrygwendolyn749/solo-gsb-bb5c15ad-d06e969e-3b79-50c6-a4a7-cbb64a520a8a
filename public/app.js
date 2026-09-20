@@ -29,6 +29,7 @@ let parsed = null; // 最近一次成功解析的 JSON 对象
 let lastExport = null; // 最近一次最优解的导出对象
 
 const LIMITS = { tokens: 10, candidates: 12, constraints: 30 };
+const KNOWN_PROFILES = ['normal', 'protanopia', 'deuteranopia', 'tritanopia'];
 
 // ---------- 解析与锁定面板 ----------
 
@@ -112,6 +113,16 @@ function validateShape(data) {
       return `constraints[${i}].minContrast 必须是 1–21 的数字。`;
     }
   }
+  if (data.profiles !== undefined && data.profiles !== null) {
+    if (!Array.isArray(data.profiles) || data.profiles.length === 0) {
+      return 'profiles 必须是非空数组。';
+    }
+    for (const p of data.profiles) {
+      if (!KNOWN_PROFILES.includes(p)) {
+        return `profiles 包含未知视型 "${p}"（可选：${KNOWN_PROFILES.join(' / ')}）。`;
+      }
+    }
+  }
   return null;
 }
 
@@ -159,8 +170,10 @@ function refreshLockPanel() {
     item.appendChild(label);
     els.tokenLocks.appendChild(item);
   }
+  const profileCount = Array.isArray(parsed.profiles) ? parsed.profiles.length : 1;
   els.inputMeta.textContent =
-    `${parsed.tokens.length} 个令牌 · ${parsed.candidates.length} 个候选色 · ${parsed.constraints.length} 条约束`;
+    `${parsed.tokens.length} 个令牌 · ${parsed.candidates.length} 个候选色 · ` +
+    `${parsed.constraints.length} 条约束 · ${profileCount} 种视型`;
 }
 
 // 将面板上的锁定勾选状态回写到 textarea 的 JSON 文本。
@@ -288,28 +301,15 @@ function renderResult(body) {
         ' / ' + reportSource.constraints.length,
       '满足约束'
     ),
+    stat((body.profiles || reportSource.profiles || ['normal']).length, '色觉视型数'),
     stat(body.stats.nodes.toLocaleString('zh-CN'), '搜索节点'),
     stat(body.stats.elapsedMs + ' ms', '耗时')
   );
   els.resultSummary.appendChild(summary);
 
-  // 约束表
+  // 约束表：每条约束按视型逐行列出改前/改后比值，并突出最差视型。
   els.constraintTable.innerHTML = '';
-  els.constraintTable.appendChild(
-    buildTable(
-      ['#', '前景', '背景', '最小对比度', '改前', '', '改后', '结果'],
-      reportSource.constraints.map((c) => [
-        String(c.index + 1),
-        c.foreground,
-        c.background,
-        { num: c.minContrast },
-        { num: ratioText(c.beforeRatio), cls: c.beforePass ? 'good' : 'bad' },
-        '→',
-        { num: ratioText(c.afterRatio), cls: c.afterPass ? 'good' : 'bad', strong: true },
-        c.afterPass ? pill('满足', true) : pill('不满足', false),
-      ])
-    )
-  );
+  els.constraintTable.appendChild(buildConstraintTable(reportSource.constraints));
 
   // 令牌表
   els.tokenTable.innerHTML = '';
@@ -356,6 +356,69 @@ function ratioText(r) {
 
 function colorCell(hex) {
   return { html: `<span class="cell-color"><span class="swatch" style="background:${hex}"></span>${hex}</span>` };
+}
+
+// 约束结果表：每条约束占 profiles.length 行，首行带 rowspan 的约束信息；
+// 改后比值最差的视型所在行高亮并标注「最差」。
+function buildConstraintTable(constraints) {
+  const table = document.createElement('table');
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  for (const h of ['#', '前景', '背景', '要求', '视型', '改前', '改后', '结果']) {
+    const th = document.createElement('th');
+    th.textContent = h;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  for (const c of constraints) {
+    const rows = c.profiles || [];
+    rows.forEach((p, pi) => {
+      const tr = document.createElement('tr');
+      const isWorst = rows.length > 1 && p.profile === c.worstAfterProfile;
+      if (isWorst) tr.classList.add('worst-profile');
+
+      if (pi === 0) {
+        for (const text of [String(c.index + 1), c.foreground, c.background, String(c.minContrast)]) {
+          const td = document.createElement('td');
+          td.rowSpan = rows.length;
+          td.textContent = text;
+          tr.appendChild(td);
+        }
+      }
+
+      const tdProfile = document.createElement('td');
+      tdProfile.appendChild(document.createTextNode(p.profile));
+      if (isWorst) {
+        tdProfile.appendChild(document.createTextNode(' '));
+        const tag = document.createElement('span');
+        tag.className = 'pill warn';
+        tag.textContent = '最差';
+        tdProfile.appendChild(tag);
+      }
+      tr.appendChild(tdProfile);
+
+      const tdBefore = document.createElement('td');
+      tdBefore.className = 'num ratio-after ' + (p.beforePass ? 'good' : 'bad');
+      tdBefore.textContent = ratioText(p.beforeRatio);
+      tr.appendChild(tdBefore);
+
+      const tdAfter = document.createElement('td');
+      tdAfter.className = 'num ratio-after strong ' + (p.afterPass ? 'good' : 'bad');
+      tdAfter.textContent = ratioText(p.afterRatio);
+      tr.appendChild(tdAfter);
+
+      const tdResult = document.createElement('td');
+      tdResult.appendChild(pill(p.afterPass ? '满足' : '不满足', p.afterPass));
+      tr.appendChild(tdResult);
+
+      tbody.appendChild(tr);
+    });
+  }
+  table.appendChild(tbody);
+  return table;
 }
 
 function buildTable(headers, rows) {

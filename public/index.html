@@ -31,11 +31,13 @@
       <p class="hint">
         上限：10 个令牌 · 12 个候选色 · 30 条约束。约束字段：
         <code>foreground</code> / <code>background</code>（令牌名）与 <code>minContrast</code>（1–21）。
+        可选 <code>profiles</code>：normal / protanopia / deuteranopia / tritanopia（缺省仅 normal）。
       </p>
       <textarea id="jsonInput" spellcheck="false" placeholder='{
   "tokens": [ { "name": "text", "color": "#888888", "locked": false } ],
   "candidates": [ "#000000", "#ffffff" ],
-  "constraints": [ { "foreground": "text", "background": "bg", "minContrast": 4.5 } ]
+  "constraints": [ { "foreground": "text", "background": "bg", "minContrast": 4.5 } ],
+  "profiles": [ "normal", "deuteranopia" ]
 }'></textarea>
       <div id="parseError" class="alert alert-error" hidden></div>
 

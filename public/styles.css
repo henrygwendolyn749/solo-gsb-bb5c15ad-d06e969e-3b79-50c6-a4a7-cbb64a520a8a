@@ -176,6 +176,9 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 }
 .pill.pass { background: var(--ok-bg); color: var(--ok); }
 .pill.fail { background: var(--bad-bg); color: var(--bad); }
+.pill.warn { background: var(--warn-bg); color: var(--warn-ink); }
+
+tr.worst-profile td { background: #fffbeb; }
 
 .ratio-arrow { color: var(--muted); margin: 0 6px; }
 .ratio-after { font-weight: 700; }

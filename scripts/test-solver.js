@@ -1,7 +1,8 @@
 'use strict';
-// 求解器行为测试：锁定冲突、全局无解、决胜顺序、上限校验、自反约束、零改色。
+// 求解器行为测试：锁定冲突、全局无解、决胜顺序、上限校验、自反约束、零改色、色觉鲁棒模式。
 const assert = require('assert');
-const { solve, parseModel, SolverError } = require('../src/solver');
+const { solve, buildReport, parseModel, SolverError } = require('../src/solver');
+const { simulateHex } = require('../src/color');
 
 function base(overrides = {}) {
   return {
@@ -193,6 +194,116 @@ assert.throws(
   });
   assert.strictEqual(r.status, 'optimal');
   assert.strictEqual(r.changes, 1);
+}
+
+// 12. profiles 校验：缺省等同 ["normal"]、去重并按固定顺序排列、拒绝未知值与空数组。
+{
+  const r = solve(base());
+  assert.deepStrictEqual(r.profiles, ['normal']);
+
+  const r2 = solve(base({ profiles: ['deuteranopia', 'normal', 'deuteranopia'] }));
+  assert.deepStrictEqual(r2.profiles, ['normal', 'deuteranopia']);
+
+  assert.throws(() => solve(base({ profiles: ['achromatopsia'] })), /未知视型/);
+  assert.throws(() => solve(base({ profiles: [] })), /profiles 必须是非空数组/);
+  assert.throws(() => solve(base({ profiles: 'normal' })), /profiles 必须是非空数组/);
+}
+
+// 13. 多视型约束：normal 达标但 protanopia 不达标时，必须继续改色直到全部视型达标。
+//     #aa0000 对 #000000：normal 约 2.71:1，protanopia 模拟后约 1.93:1。
+{
+  const input = {
+    tokens: [
+      { name: 'fg', color: '#aa0000' },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: ['#ffffff'],
+    constraints: [{ foreground: 'fg', background: 'bg', minContrast: 2.5 }],
+  };
+  const normalOnly = solve({ ...input, profiles: ['normal'] });
+  assert.strictEqual(normalOnly.status, 'optimal');
+  assert.strictEqual(normalOnly.changes, 0);
+
+  const robust = solve({ ...input, profiles: ['normal', 'protanopia'] });
+  assert.strictEqual(robust.status, 'optimal');
+  assert.strictEqual(robust.changes, 1);
+  assert.strictEqual(robust.assignment.fg, '#ffffff');
+}
+
+// 14. 两端锁定：冲突必须指明具体失败视型。
+{
+  const r = solve({
+    tokens: [
+      { name: 'fg', color: '#aa0000', locked: true },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: [],
+    constraints: [{ foreground: 'fg', background: 'bg', minContrast: 2.5 }],
+    profiles: ['normal', 'protanopia'],
+  });
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'locked-conflict');
+  assert.strictEqual(r.conflicts[0].kind, 'both-locked');
+  assert.deepStrictEqual(r.conflicts[0].failedProfiles, ['protanopia']);
+  assert.ok(r.conflicts[0].message.includes('protanopia'));
+  assert.strictEqual(r.conflicts[0].actual < 2.5, true);
+}
+
+// 15. 单侧锁定：仅 protanopia 视型下对端值域无解（normal 下本可不改色）。
+//     #ff0000 对 #004400：normal 约 2.87:1，protanopia 模拟后约 1.72:1。
+{
+  const input = {
+    tokens: [
+      { name: 'fg', color: '#ff0000', locked: true },
+      { name: 'bg', color: '#004400' },
+    ],
+    candidates: [],
+    constraints: [{ foreground: 'fg', background: 'bg', minContrast: 2.5 }],
+    profiles: ['normal', 'protanopia'],
+  };
+  const r = solve(input);
+  assert.strictEqual(r.status, 'unsatisfiable');
+  assert.strictEqual(r.reason, 'locked-conflict');
+  assert.strictEqual(r.conflicts[0].kind, 'locked-foreground');
+  assert.deepStrictEqual(r.conflicts[0].failedProfiles, ['protanopia']);
+  assert.ok(r.conflicts[0].message.includes('protanopia'));
+
+  const normalOnly = solve({ ...input, profiles: ['normal'] });
+  assert.strictEqual(normalOnly.status, 'optimal');
+  assert.strictEqual(normalOnly.changes, 0);
+}
+
+// 16. 报告按约束列出各视型改前/改后比值，并标出最差视型。
+{
+  const input = {
+    tokens: [
+      { name: 'fg', color: '#aa0000' },
+      { name: 'bg', color: '#000000', locked: true },
+    ],
+    candidates: ['#ffffff'],
+    constraints: [{ foreground: 'fg', background: 'bg', minContrast: 2.5 }],
+    profiles: ['normal', 'protanopia'],
+  };
+  const r = solve(input);
+  const report = buildReport(input, undefined, r.assignment);
+  assert.deepStrictEqual(report.profiles, ['normal', 'protanopia']);
+  const c = report.constraints[0];
+  assert.strictEqual(c.profiles.length, 2);
+  assert.strictEqual(c.worstBeforeProfile, 'protanopia');
+  assert.strictEqual(c.worstAfterProfile, 'normal'); // 改后为白/黑，两视型并列 21:1，取前者
+  assert.strictEqual(c.afterPass, true);
+  assert.ok(c.profiles.every((p) => p.afterPass));
+  assert.ok(c.profiles.find((p) => p.profile === 'protanopia').beforeRatio < 2.5);
+}
+
+// 17. 模拟管线：normal 恒等；CVD 矩阵保持白/黑不变；模拟结果稳定可复现。
+{
+  assert.strictEqual(simulateHex('#1d4ed8', 'normal'), '#1d4ed8');
+  for (const p of ['protanopia', 'deuteranopia', 'tritanopia']) {
+    assert.strictEqual(simulateHex('#ffffff', p), '#ffffff');
+    assert.strictEqual(simulateHex('#000000', p), '#000000');
+    assert.strictEqual(simulateHex('#1d4ed8', p), simulateHex('#1d4ed8', p));
+  }
 }
 
 console.log('全部求解器测试通过');
